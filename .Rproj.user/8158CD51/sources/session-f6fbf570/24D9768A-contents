@@ -1,0 +1,1 @@
+usethis::use_data(scData, overwrite = TRUE, compress = "xz") 

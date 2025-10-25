@@ -1,0 +1,387 @@
+#' @useDynLib WinCRT, .registration = TRUE
+#' @importFrom Rcpp evalCpp
+NULL
+#' Win Ratio for Cluster-Randomized Trials (Hierarchical or Single Endpoint)
+#'
+#' Computes win/loss/tie tallies and win-ratio statistics in CRTs using a
+#' hierarchical endpoint (tiers) or a single endpoint.
+#' performs the pairwise counting; this R wrapper handles validation and summaries.
+#'
+#' @param data A data.frame/tibble in \emph{long} format (possibly multiple rows per subject).
+#' @param id Name of subject ID column. Default: "id".
+#' @param trt Name of treatment/arm indicator column (two arms). Default: "z".
+#' @param cluster Name of cluster ID column. Default: "cluster".
+#' @param outcome Name of the numeric outcome column. Default: "outcome".
+#'   For survival-style data, this is a time; for a single endpoint, it is the scalar outcome.
+#' @param tier Name of the tier code column. Default: "tier". Use \code{0} for censoring rows
+#'   (survival-style), and \code{1..K} for event tiers with larger meaning higher priority.
+#'   For a single endpoint, set \code{tier=1} for all rows and provide no censoring rows.
+#' @param lower_better Logical; if \code{TRUE}, smaller outcome values mean better.
+#'   The scale is flipped internally so that the kernel’s “earlier is worse” rule yields
+#'   the correct win/loss direction. Default: \code{FALSE}.
+#'
+#' @return An object of class \code{"WinCRT"} with:
+#' \itemize{
+#'   \item \code{estimates}: \code{W_D}, \code{logW_R}, \code{logW_O}, \code{p_ties}
+#'   \item \code{variances}: \code{VarW_D}, \code{VarlogW_R}, \code{VarlogW_O}
+#'   \item \code{rho}: rank-based within-cluster correlation
+#'   \item \code{counts}: totals across arms: \code{wins}, \code{losses}, \code{ties}, \code{T0}, \code{ties_cnt}
+#'   \item \code{per_id}: per-subject table: \code{id, cluster, z, w, l, t, tie_diff, rank}
+#'   \item \code{per_cluster}: per-cluster table with score \code{S} and \code{z}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#'   # Survival-style with tiers (0=censor, 1=hosp, 2=death)
+#'   res <- wincrt(df, id="id", trt="z", cluster="cluster",
+#'                 outcome="time", tier="event")
+#'
+#'   # Single endpoint (no censoring), smaller is better
+#'   df$tier <- 1L
+#'   res <- wincrt(df, outcome="score", tier="tier", lower_better=TRUE)
+#' }
+#'
+#' @import dplyr Rcpp
+#' @importFrom rlang .data !! sym
+#' @export
+wincrt <- function(data,
+                   id,
+                   trt,
+                   cluster,
+                   outcome,
+                   tier,
+                   lower_better = FALSE) {
+
+
+
+  # ---------- validations ----------
+  if (!is.data.frame(data)) data.frame(data)
+  nm <- names(data)
+  req <- c(id, trt, cluster, outcome, tier)
+  miss <- setdiff(req, nm)
+  if (length(miss)) stop("Missing required columns: ", paste(miss, collapse = ", "))
+
+  df <- as.data.frame(data)
+
+  # Canonical names for C++: id, z, y, tier
+  df <- dplyr::rename(
+    df,
+    id      = !!rlang::sym(id),
+    z       = !!rlang::sym(trt),
+    cluster = !!rlang::sym(cluster),
+    y       = !!rlang::sym(outcome),
+    tier    = !!rlang::sym(tier)
+  )
+
+  if (any(is.na(df$id))) stop("`id` contains NA.")
+  if (any(is.na(df$z)))  stop("`z` contains NA.")
+  if (dplyr::n_distinct(df$z) != 2) stop("`z` must have exactly two distinct values (two arms).")
+  if (!is.numeric(df$y))  stop("`outcome` must be numeric.")
+  if (!all(df$tier >= 0, na.rm = TRUE))
+    stop("`tier` must be >= 0 (0=censor, 1..K=tiers with larger=more important).")
+
+  # Flip scale if smaller outcome is better
+  if (isTRUE(lower_better)) {
+    df$y <- -df$y
+  }
+
+  # ---------- per-subject unique table (no Nc) ----------
+  per_id <- df |>
+    dplyr::distinct(.data$id, .data$cluster, .data$z)
+
+  n <- nrow(per_id)
+  if (n < 2) stop("Need at least 2 distinct subjects after preprocessing.")
+
+  # Keep the id order stable for mapping kernel outputs to per_id rows
+  # Ensure df (long) rows are not required to be sorted the same way:
+  # wr_hier is expected to produce a 4*n vector in the per_id order.
+  # If your wr_hier relies on first-appearance order, make sure df is ordered by per_id id order.
+  # We enforce that by matching:
+  id_index <- match(df$id, per_id$id)
+  if (any(is.na(id_index))) stop("Internal mapping error: some long rows do not map to distinct subjects.")
+
+  # ---------- call C++ kernel ----------
+  # wr_hier requires columns: id, z, y, tier
+  ans <- wr_hier(df[, c("id", "z", "y", "tier")])
+  if (length(ans) != 4L * n) {
+    stop("Internal error: wr_hier returned length ", length(ans), " but expected ", 4L * n, ".")
+  }
+
+  w        <- ans[seq_len(n)]
+  l        <- ans[(n + 1):(2 * n)]
+  t_all    <- ans[(2 * n + 1):(3 * n)]
+  tie_diff <- ans[(3 * n + 1):(4 * n)]
+
+  per_id$w <- as.numeric(w)
+  per_id$l <- as.numeric(l)
+  per_id$t <- as.numeric(t_all)
+  per_id$tie_diff <- as.numeric(tie_diff)
+  per_id$rank <- per_id$w + 1 + per_id$t / 2
+
+  # ---------- arm mapping ----------
+  z_vals <- sort(unique(per_id$z))
+  arm_C  <- z_vals[1]
+  arm_T  <- z_vals[2]
+  ti <- which(per_id$z == arm_T)
+  ci <- which(per_id$z == arm_C)
+
+  N_T <- length(ti); N_C <- length(ci)
+  if (N_T == 0 || N_C == 0) stop("Both arms must be present after preprocessing.")
+
+  # Cross-arm totals
+  ties_cnt <- sum(per_id$tie_diff[ti])
+  T0       <- as.numeric(N_T) * as.numeric(N_C)
+
+  W_D_sum  <- sum((per_id$w - per_id$l)[ti])
+  Wval     <- (T0 - ties_cnt + W_D_sum) / 2
+  Lval     <- (T0 - ties_cnt - W_D_sum) / 2
+  if (Wval < 0) Wval <- 0
+  if (Lval < 0) Lval <- 0
+
+  p_ties <- ties_cnt / T0
+  W_D    <- W_D_sum / T0
+
+  # logs with small guard if needed
+  if (Lval == 0 || Wval == 0) {
+    eps <- .Machine$double.eps
+    logW_R <- log((Wval + eps) / (Lval + eps))
+    logW_O <- log(((Wval + 0.5 * ties_cnt) + eps) / ((Lval + 0.5 * ties_cnt) + eps))
+  } else {
+    logW_R <- log(Wval / Lval)
+    logW_O <- log((Wval + 0.5 * ties_cnt) / (Lval + 0.5 * ties_cnt))
+  }
+
+  # ---------- per-cluster scores (no Nc) ----------
+  S_tbl <- per_id |>
+    dplyr::group_by(.data$cluster) |>
+    dplyr::summarise(
+      S = sum(.data$w - .data$l),
+      z = dplyr::first(.data$z),
+      .groups = "drop"
+    )
+
+  M1 <- sum(S_tbl$z == arm_T)
+  M0 <- sum(S_tbl$z == arm_C)
+  M  <- M1 + M0
+  if (M1 == 0 || M0 == 0) stop("Both arms must be present at the cluster level.")
+  if (M1 < 2 || M0 < 2) warning("At least one arm has fewer than 2 clusters; variance estimates may be unstable/undefined.")
+
+  # Unbiased per-arm cluster variance (your ALT formula; does NOT use Nc)
+  # VarW_D = ((M1*M0)/(M*N_T*N_C))^2 * ( SS_T/(M1*(M1-1)) + SS_C/(M0*(M0-1)) )
+  S_T <- S_tbl$S[S_tbl$z == arm_T]; S_T_bar <- mean(S_T); SS_T <- sum((S_T - S_T_bar)^2)
+  S_C <- S_tbl$S[S_tbl$z == arm_C]; S_C_bar <- mean(S_C); SS_C <- sum((S_C - S_C_bar)^2)
+
+  VarW_D <- if (M1 > 1 && M0 > 1) {
+    ((M1 * M0) / (M * as.numeric(N_T) * as.numeric(N_C)))^2 *
+      ( SS_T / (M1 * (M1 - 1)) + SS_C / (M0 * (M0 - 1)) )
+  } else NA_real_
+
+  VarlogW_R <- if (!is.na(VarW_D)) {
+    (2 / (1 - p_ties) / (1 - (W_D / (1 - p_ties))^2))^2 * VarW_D
+  } else NA_real_
+
+  VarlogW_O <- if (!is.na(VarW_D)) {
+    (2 / (1 - W_D^2))^2 * VarW_D
+  } else NA_real_
+
+  # ---------- rho from ranks ----------
+  n_subj <- nrow(per_id)
+  per_id$weight <- 1 / n_subj
+  F_bar <- mean(per_id$rank)
+  denom <- sum(per_id$weight * (per_id$rank - F_bar)^2)
+
+  rank_sum <- per_id |>
+    dplyr::group_by(.data$cluster) |>
+    dplyr::summarise(
+      product = {
+        r <- rank - F_bar
+        m <- length(r)
+        if (m < 2) 0 else 2 * sum(utils::combn(r, 2, prod)) / (m * (m - 1)) * sum(weight)
+      },
+      .groups = "drop"
+    )
+  rho <- if (denom > 0) sum(rank_sum$product) / denom else NA_real_
+
+  # ---------- assemble ----------
+  res <- list(
+    estimates = list(
+      W_D    = W_D,
+      logW_R = logW_R,
+      logW_O = logW_O,
+      p_ties = p_ties
+    ),
+    variances = list(
+      VarW_D     = VarW_D,
+      VarlogW_R  = VarlogW_R,
+      VarlogW_O  = VarlogW_O
+    ),
+    rho = rho,
+    counts = list(
+      wins     = as.numeric(Wval),
+      losses   = as.numeric(Lval),
+      ties     = as.numeric(ties_cnt),
+      T0       = as.numeric(T0),
+      ties_cnt = as.numeric(ties_cnt)
+    ),
+    per_id = per_id[, c("id","cluster","z","w","l","t","tie_diff","rank")],
+    per_cluster = S_tbl
+  )
+  class(res) <- "WinCRT"
+  res
+}
+
+#' Summarize a WinCRT fit
+#'
+#' Produces inferential summaries for a \code{WinCRT} object, including
+#' estimates, standard errors, test statistics, p-values, and confidence intervals
+#' for user-selected estimands under either a t- or z-reference distribution.
+#'
+#' @param object A fitted object of class \code{WinCRT}, as returned by \code{wincrt()}.
+#' @param test Character string specifying the reference distribution:
+#'   \code{"t"} (default) uses a t-test with degrees of freedom equal to the total
+#'   number of clusters minus 2; \code{"z"} uses a standard normal reference.
+#' @param estimand Character string naming the target parameter to report:
+#'   \code{"logWR"} (log win ratio), \code{"logWO"} (log win odds),
+#'   \code{"WD"} (net win proportion), or \code{"all"} to report all three.
+#' @param alpha Numeric scalar in \code{(0,1)} giving the significance level
+#'   used to construct confidence intervals (default \code{0.05} for 95\% CIs).
+#' @param alternative Character string indicating the alternative hypothesis:
+#'   \code{"two.sided"} (default), \code{"greater"} (parameter > 0),
+#'   or \code{"less"} (parameter < 0).
+#'
+#' @details
+#' The null hypotheses tested are \eqn{\text{logWR}=0}, \eqn{\text{logWO}=0}, and \eqn{\text{WD}=0}.
+#' With \code{test="t"}, degrees of freedom are set to \(M-2\), where \(M\) is the total
+#' number of clusters across arms. With \code{test="z"}, standard normal quantiles are used.
+#'
+#' @return An object of class \code{"summary.WinCRT"} containing:
+#' \itemize{
+#'   \item \code{table}: a data frame with columns \code{estimand}, \code{estimate},
+#'         \code{SE}, \code{statistic}, \code{df} (if t-test), \code{p_value},
+#'         \code{CI_low}, \code{CI_high}.
+#'   \item \code{test}, \code{alpha}, \code{alternative}: the analysis options used.
+#'   \item \code{info}: a list of useful counts and metadata (clusters per arm,
+#'         degrees of freedom, subjects per arm, total wins/losses/ties between arms,
+#'         total cross-arm pairs \code{T0}, tie proportion \code{p_ties}, and rank ICC \code{rho}).
+#' }
+#'
+#' @seealso \code{\link{wincrt}} for fitting; \code{\link{print.summary.WinCRT}} for printing.
+#'
+#' @examples
+#' \dontrun{
+#' fit <- wincrt(df, id="id", trt="z", cluster="cluster",
+#'               outcome="outcome", tier="tier")
+#' summary(fit, test="t", estimand="all", alpha=0.05, alternative="two.sided")
+#' summary(fit, test="z", estimand="logWR", alpha=0.025, alternative="greater")
+#' }
+#' @export
+summary.WinCRT <- function(object,
+                           test = c("t", "z"),
+                           estimand = c("logWR", "logWO", "WD", "all"),
+                           alpha = 0.05,
+                           alternative = c("two.sided", "greater", "less")) {
+
+  stopifnot(inherits(object, "WinCRT"))
+  test       <- match.arg(test)
+  estimand   <- match.arg(estimand)
+  alternative <- match.arg(alternative)
+  if (!is.numeric(alpha) || length(alpha) != 1L || alpha <= 0 || alpha >= 1)
+    stop("`alpha` must be a single number in (0,1).")
+
+  ests <- object$estimates
+  vars <- object$variances
+  per_id <- object$per_id
+  per_cluster <- object$per_cluster
+
+  # cluster counts and dfs
+  z_vals <- sort(unique(per_cluster$z))
+  arm_C  <- z_vals[1]
+  arm_T  <- z_vals[2]
+  M1 <- sum(per_cluster$z == arm_T)
+  M0 <- sum(per_cluster$z == arm_C)
+  M  <- M1 + M0
+  df <- max(M - 2, 1)  # guard; user expects M-2 df for t-test
+
+  # Prepare a small helper to compute CI/p given estimate & variance
+  qfun <- switch(test,
+                 "t" = function(p) qt(p, df = df),
+                 "z" = function(p) qnorm(p))
+  pfun <- switch(test,
+                 "t" = function(x) pt(x, df = df, lower.tail = FALSE),
+                 "z" = function(x) pnorm(x, lower.tail = FALSE))
+
+  build_row <- function(name, est, var) {
+    if (is.na(var)) {
+      return(data.frame(estimand = name, estimate = est, se = NA_real_,
+                        statistic = NA_real_, df = if (test=="t") df else NA_integer_,
+                        p_value = NA_real_, ci_low = NA_real_, ci_high = NA_real_,
+                        row.names = NULL))
+    }
+    se <- sqrt(var)
+    # Test statistic: H0: parameter = 0
+    stat <- est / se
+    # CI
+    alpha2 <- if (alternative == "two.sided") alpha/2 else alpha
+    crit <- qfun(1 - alpha2)
+    if (alternative == "two.sided") {
+      ci_low  <- est - crit * se
+      ci_high <- est + crit * se
+      pval <- 2 * pfun(abs(stat))
+    } else if (alternative == "greater") { # H1: parameter > 0
+      ci_low  <- est - crit * se
+      ci_high <- Inf
+      pval <- pfun(stat)
+    } else { # "less", H1: parameter < 0
+      ci_low  <- -Inf
+      ci_high <- est + crit * se
+      pval <- pfun(-stat)
+    }
+    data.frame(estimand = name, estimate = est, se = se,
+               statistic = stat,
+               df = if (test=="t") df else NA_integer_,
+               p_value = pval, ci_low = ci_low, ci_high = ci_high,
+               row.names = NULL)
+  }
+
+  # Select which estimands to report
+  rows <- list()
+  add_row <- function(which) {
+    if (which == "logWR") {
+      rows[[length(rows)+1]] <<- build_row("logWR", ests$logW_R, vars$VarlogW_R)
+    } else if (which == "logWO") {
+      rows[[length(rows)+1]] <<- build_row("logWO", ests$logW_O, vars$VarlogW_O)
+    } else if (which == "WD") {
+      rows[[length(rows)+1]] <<- build_row("WD", ests$W_D,    vars$VarW_D)
+    }
+  }
+  if (estimand == "all") {
+    add_row("logWR"); add_row("logWO"); add_row("WD")
+  } else {
+    add_row(estimand)
+  }
+  tab <- do.call(rbind, rows)
+
+  # Counts to display
+  counts <- object$counts
+  n_per_arm <- table(per_id$z)
+  N_T <- as.integer(n_per_arm[names(n_per_arm)==as.character(arm_T)])
+  N_C <- as.integer(n_per_arm[names(n_per_arm)==as.character(arm_C)])
+
+  out <- list(
+    table = tab,
+    test = test,
+    alpha = alpha,
+    alternative = alternative,
+    info = list(
+      M1 = M1, M0 = M0, M = M, df = if (test=="t") df else NA_integer_,
+      N_T = N_T, N_C = N_C,
+      wins = counts$wins, losses = counts$losses, ties = counts$ties,
+      T0 = counts$T0, ties_cnt = counts$ties_cnt,
+      p_ties = ests$p_ties,
+      rho = object$rho
+    )
+  )
+  class(out) <- "summary.WinCRT"
+  out
+}
+

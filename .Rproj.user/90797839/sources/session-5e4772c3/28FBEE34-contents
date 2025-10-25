@@ -1,0 +1,14 @@
+library(WinCRT)
+
+data(scData)
+data(orData)
+
+scfit <- wincrt(scData,id="id",trt="z",cluster="cluster",
+              outcome = "time",tier = "event")
+summary(scfit,test="z")
+
+
+orData$tier <- 1
+orfit <- wincrt(orData,id="id",trt="z",cluster="cluster",
+                outcome = "y",tier = "tier")
+summary(orfit,test="z")

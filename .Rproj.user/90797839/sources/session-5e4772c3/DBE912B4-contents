@@ -1,0 +1,16 @@
+#' Example dataset: orData
+#'
+#' A demonstration dataset for WinCRT examples.
+#'
+#' @format A data frame with columns:
+#' \describe{
+#'   \item{id}{Subject id (integer).}
+#'   \item{z}{Treatment indicator (two arms).}
+#'   \item{cluster}{Cluster identifier.}
+#'   \item{outcome}{Numeric outcome (time or scalar).}
+#'   \item{tier}{Tier code: 0=censor (optional), 1..K=event tiers; for a single endpoint set to 1.}
+#' }
+#' @usage data(orData)
+#' @examples
+#' data(orData); head(orData)
+"orData"

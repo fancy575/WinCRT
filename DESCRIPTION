@@ -1,0 +1,41 @@
+Package: WinCRT
+Type: Package
+Title: Win Ratio for Cluster-Randomized Trials with Hierarchical or Single Endpoints
+Version: 0.1.0
+Authors@R: 
+    c(person(given = "Xi",  family = "Fang", email = "x.fang@yale.edu", role = c("aut", "cre")),
+      person(given = "Fan", family = "Li",   email = "fan.f.li@yale.edu", role = "aut"))
+Description: 
+    Tools to compute win/loss/tie tallies and win-ratio statistics in
+    cluster-randomized trials (CRTs) with hierarchical endpoints or a single
+    endpoint. The function
+    supports survival-style data and non-survival
+    single endpoints. Inference is provided via t- or z-tests for
+    multiple estimands (log win ratio, log win odds, and net win proportion),
+    with summaries at the subject and cluster level.
+License: MIT + file LICENSE
+URL: https://github.com/your-org/WinCRT
+BugReports: https://github.com/your-org/WinCRT/issues
+Depends:
+    R (>= 4.1.0)
+Imports:
+    Rcpp (>= 1.0.12),
+    dplyr,
+    rlang,
+    stats,
+    utils
+LinkingTo:
+    Rcpp
+Suggests:
+    testthat (>= 3.0.0),
+    roxygen2,
+    devtools,
+    knitr,
+    rmarkdown
+Config/testthat/edition: 3
+Encoding: UTF-8
+LazyData: false
+ByteCompile: true
+SystemRequirements: C++11
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
